@@ -66,6 +66,13 @@ repos=(
 "https://github.com/Pylons/pyramid_retry.git"
 "https://github.com/Pylons/substanced.git"
 "https://github.com/pyca/asn1crypto.git"
+
+https://github.com/tqdm/tqdm.git
+https://github.com/yaml/pyyaml.git
+https://github.com/python-attrs/cattrs.git
+https://github.com/platformdirs/platformdirs.git
+https://github.com/more-itertools/more-itertools.git
+https://github.com/psf/black.git
 )
 
 for repo in "${repos[@]}"; do

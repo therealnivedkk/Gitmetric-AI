@@ -1,0 +1,18 @@
+[
+  "avg_cc",
+  "avg_mi",
+  "avg_halstead_volume",
+  "total_loc",
+  "documentation_coverage",
+  "pct_low_risk",
+  "pct_moderate_risk",
+  "pct_high_risk",
+  "pct_very_high_risk",
+  "commit_count",
+  "commit_freq",
+  "contributors",
+  "total_churn",
+  "churn_concentration",
+  "branch_count",
+  "merge_count"
+]
