@@ -118,7 +118,7 @@ def predict(aggregates: dict[str, Any]) -> dict[str, Any]:
         for name, imp in zip(feature_names, importances)
     }
 
-    # Sort by importance descending (for Module 5 / dashboard)
+    # Sort by importance descending
     feature_contributions = dict(
         sorted(feature_contributions.items(), key=lambda x: x[1], reverse=True)
     )

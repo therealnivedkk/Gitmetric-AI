@@ -7,79 +7,148 @@ import re
 import sys
 from typing import Any
 
-# Security Check Rules (AST + Regex)
+# Security Check Rules (Context-Aware AST + Regex)
 
 SECRET_REGEX = re.compile(
-    r'(?i)(password|secret|api_key|access_token|private_key)\s*=\s*[\'"][^\'"]{8,}[\'"]'
+    r'(?i)\b(api[_-]?key|access[_-]?token|secret[_-]?key|private[_-]?key|auth[_-]?token|password)\b\s*=\s*[\'"][A-Za-z0-9_\-\.\/+=]{16,}[\'"]'
 )
 
+SAFE_SECRET_PATTERNS = re.compile(
+    r'(?i)(dummy|test|example|fake|placeholder|none|null|env|os\.getenv|os\.environ|your[_-]|changeme|sample|default)'
+)
+
+
+def _is_test_file(filepath: str) -> bool:
+    """Checks if the file is in a test suite or fixture directory."""
+    normalized = filepath.replace("\\", "/").lower()
+    return bool(
+        re.search(r'(^|/)(tests?|testing|unit_tests|fixtures?|conftest\.py)(/|$)', normalized)
+        or normalized.endswith("_test.py")
+        or normalized.endswith("test_.py")
+    )
+
+
+def _is_literal_or_constant(node: ast.AST) -> bool:
+    """Returns True if the AST node represents an invariant static literal or constant."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_literal_or_constant(elt) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(_is_literal_or_constant(k) and _is_literal_or_constant(v)
+                   for k, v in zip(node.keys, node.values) if k is not None)
+    return False
+
+
 class SecurityVisitor(ast.NodeVisitor):
-    """AST visitor to find common security anti-patterns in Python files."""
+    """
+    Context-aware AST visitor to detect genuine security anti-patterns.
+    Analyzes call context, argument types, and surrounding scope to minimize false positives.
+    """
 
     def __init__(self, filepath: str):
         self.filepath = filepath
+        self.is_test = _is_test_file(filepath)
         self.issues: list[dict[str, Any]] = []
 
     def visit_Call(self, node: ast.Call):
         func_name = ""
+        module_name = ""
+
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
         elif isinstance(node.func, ast.Attribute):
             func_name = node.func.attr
+            if isinstance(node.func.value, ast.Name):
+                module_name = node.func.value.id
 
-        # 1. eval() or exec()
-        if func_name in ("eval", "exec"):
-            self.issues.append({
-                "filepath": self.filepath,
-                "lineno": node.lineno,
-                "rule_id": "SEC-001",
-                "severity": "HIGH",
-                "title": f"Dangerous dynamic execution via `{func_name}()`",
-                "description": f"Use of `{func_name}()` can allow arbitrary code execution if user-controlled input reaches it.",
-            })
+        # 1. Dynamic Code Execution: eval() or exec()
+        if func_name in ("eval", "exec") and not module_name:
+            if node.args:
+                arg0 = node.args[0]
+                if not _is_literal_or_constant(arg0):
+                    severity = "MEDIUM" if self.is_test else "HIGH"
+                    self.issues.append({
+                        "filepath": self.filepath,
+                        "lineno": node.lineno,
+                        "rule_id": "SEC-001",
+                        "severity": severity,
+                        "title": f"Dynamic code execution via `{func_name}()` with non-constant input",
+                        "description": (
+                            f"Dynamic `{func_name}()` called with dynamic variable or expression. "
+                            "Untrusted inputs reaching this can lead to remote code execution. "
+                            "Consider `ast.literal_eval()` or structured dispatch."
+                        ),
+                    })
 
-        # 2. subprocess with shell=True
+        # 2. Subprocess Execution with shell=True
         if func_name in ("Popen", "call", "check_call", "check_output", "run"):
-            for kw in node.keywords:
-                if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
-                    self.issues.append({
-                        "filepath": self.filepath,
-                        "lineno": node.lineno,
-                        "rule_id": "SEC-002",
-                        "severity": "HIGH",
-                        "title": "Subprocess execution with `shell=True`",
-                        "description": "Spawning subprocesses with `shell=True` exposes the application to command injection vulnerabilities.",
-                    })
+            if module_name in ("subprocess", ""):
+                shell_kw = next((kw for kw in node.keywords if kw.arg == "shell"), None)
+                if shell_kw and isinstance(shell_kw.value, ast.Constant) and shell_kw.value.value is True:
+                    cmd_arg = node.args[0] if node.args else None
+                    if not cmd_arg:
+                        for kw in node.keywords:
+                            if kw.arg in ("args", "command", "cmd"):
+                                cmd_arg = kw.value
+                                break
 
-        # 3. pickle.loads or pickle.load
-        if func_name in ("loads", "load"):
-            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-                if node.func.value.id == "pickle":
-                    self.issues.append({
-                        "filepath": self.filepath,
-                        "lineno": node.lineno,
-                        "rule_id": "SEC-003",
-                        "severity": "MEDIUM",
-                        "title": "Insecure deserialization via `pickle`",
-                        "description": "Pickle deserialization of untrusted data can lead to remote code execution. Prefer JSON or safe serialization.",
-                    })
+                    if cmd_arg and isinstance(cmd_arg, ast.Constant) and isinstance(cmd_arg.value, str):
+                        if any(op in cmd_arg.value for op in (";", "&&", "||", "|", "`", "$(")):
+                            self.issues.append({
+                                "filepath": self.filepath,
+                                "lineno": node.lineno,
+                                "rule_id": "SEC-002",
+                                "severity": "LOW",
+                                "title": "Subprocess with `shell=True` using chained commands",
+                                "description": "Hardcoded shell command contains pipeline or chaining operators.",
+                            })
+                    else:
+                        severity = "MEDIUM" if self.is_test else "HIGH"
+                        self.issues.append({
+                            "filepath": self.filepath,
+                            "lineno": node.lineno,
+                            "rule_id": "SEC-002",
+                            "severity": severity,
+                            "title": "Unsafe command construction with `shell=True`",
+                            "description": (
+                                "Subprocess spawned with `shell=True` using a dynamic argument. "
+                                "Vulnerable to command injection if argument contains unsanitized input. "
+                                "Pass arguments as an argument list with `shell=False`."
+                            ),
+                        })
 
-        # 4. tempfile.mktemp
-        if func_name == "mktemp":
+        # 3. Insecure Deserialization: pickle.loads / pickle.load
+        if func_name in ("loads", "load") and module_name == "pickle":
+            if not self.is_test:
+                self.issues.append({
+                    "filepath": self.filepath,
+                    "lineno": node.lineno,
+                    "rule_id": "SEC-003",
+                    "severity": "MEDIUM",
+                    "title": "Insecure deserialization via `pickle`",
+                    "description": (
+                        "Pickle deserialization of untrusted payloads can lead to arbitrary code execution. "
+                        "Prefer JSON, msgpack, or cryptographic HMAC signatures for serialized objects."
+                    ),
+                })
+
+        # 4. Insecure Temporary File Creation: tempfile.mktemp
+        if func_name == "mktemp" and module_name in ("tempfile", ""):
             self.issues.append({
                 "filepath": self.filepath,
                 "lineno": node.lineno,
                 "rule_id": "SEC-004",
                 "severity": "MEDIUM",
-                "title": "Insecure temporary file creation (`tempfile.mktemp`)",
-                "description": "Use of `tempfile.mktemp()` is deprecated and vulnerable to symlink race conditions. Use `NamedTemporaryFile` instead.",
+                "title": "Deprecated insecure temporary file creation (`tempfile.mktemp`)",
+                "description": "Use of `tempfile.mktemp()` is susceptible to race condition symlink attacks. Use `tempfile.NamedTemporaryFile()`.",
             })
 
         self.generic_visit(node)
 
 
 def scan_file_security(full_path: str, rel_path: str) -> list[dict[str, Any]]:
-    """Runs regex and AST security inspections on a single python file."""
+
     issues: list[dict[str, Any]] = []
 
     try:
@@ -88,21 +157,23 @@ def scan_file_security(full_path: str, rel_path: str) -> list[dict[str, Any]]:
     except OSError:
         return issues
 
-    # Regex scan for hardcoded secrets
-    for line_idx, line in enumerate(content.splitlines(), start=1):
-        if SECRET_REGEX.search(line):
-            # Avoid flagging test fixture dummy strings
-            if not any(dummy in line.lower() for dummy in ("dummy", "example", "test", "fake", "placeholder")):
-                issues.append({
-                    "filepath": rel_path,
-                    "lineno": line_idx,
-                    "rule_id": "SEC-005",
-                    "severity": "MEDIUM",
-                    "title": "Potential hardcoded credential or secret",
-                    "description": "Detected hardcoded assignment that looks like a password or API token.",
-                })
+    is_test = _is_test_file(rel_path)
 
-    # AST scan
+    # 1. Regex scan for hardcoded credentials (skip tests and safe fixtures)
+    if not is_test:
+        for line_idx, line in enumerate(content.splitlines(), start=1):
+            if SECRET_REGEX.search(line):
+                if not SAFE_SECRET_PATTERNS.search(line):
+                    issues.append({
+                        "filepath": rel_path,
+                        "lineno": line_idx,
+                        "rule_id": "SEC-005",
+                        "severity": "HIGH",
+                        "title": "Potential hardcoded credential or secret key",
+                        "description": "Detected hardcoded high-entropy secret assignment. Use environment variables or a secrets manager.",
+                    })
+
+    # 2. AST Context-Aware Scan
     try:
         tree = ast.parse(content)
         visitor = SecurityVisitor(rel_path)
@@ -119,12 +190,6 @@ def scan_file_security(full_path: str, rel_path: str) -> list[dict[str, Any]]:
 def detect_issues(extracted_data: dict[str, Any], repo_path: str | None = None) -> dict[str, Any]:
     """
     Consumes the output of extractors.analyze_repository() and computes:
-      - complexity_issues: per-function McCabe CC flags (>10, >20, >50)
-      - maintainability_issues: files with MI < 65
-      - undocumented_issues: functions/classes missing docstrings
-      - hotspots: top churn + complexity files
-      - security_issues: AST/regex security flags
-      - summary: aggregated issue counts by severity
     """
     files = extracted_data.get("files", [])
     base_repo_path = repo_path or extracted_data.get("repo_path", "")

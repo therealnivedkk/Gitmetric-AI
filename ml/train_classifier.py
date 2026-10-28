@@ -1,36 +1,3 @@
-"""
-train_classifier.py
-
-Offline ML Training Pipeline for GitMetric AI — Module 7.
-
-Trains a RandomForestClassifier on training_data.csv to predict
-repository health labels: "Healthy", "Stable", or "Needs Attention".
-
-Class Imbalance Handling:
-    The 47-repository corpus has a severe class imbalance:
-        Stable:          29 samples (majority)
-        Needs Attention: 13 samples
-        Healthy:          5 samples (minority)
-
-    This is addressed via SMOTE (Synthetic Minority Over-sampling Technique),
-    Chawla et al., 2002, "SMOTE: Synthetic Minority Over-sampling Technique,"
-    Journal of Artificial Intelligence Research, 16, pp. 321-357.
-
-    SMOTE generates synthetic minority-class examples by interpolating between
-    existing real feature vectors in k-nearest-neighbor space. It is applied
-    ONLY to the training split inside each cross-validation fold (to prevent
-    data leakage). The training_data.csv remains 100% real observed repositories.
-
-Output:
-    ml/model.pkl          — serialized trained model (joblib format)
-    ml/feature_names.json — ordered list of feature names used at train time
-
-Run from GitMetricAI/ml/:
-    python train_classifier.py
-
-Or from root:
-    backend\\venv\\Scripts\\python.exe ml\\train_classifier.py
-"""
 
 from __future__ import annotations
 
@@ -128,14 +95,6 @@ def smote_augment(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Apply SMOTE to training data.
-
-    k_neighbors is set to min(n_minority_samples - 1, 5) to handle
-    the case where minority class has very few examples (Healthy: 5 real samples).
-
-    Reference:
-        Chawla, N.V., Bowyer, K.W., Hall, L.O., Kegelmeyer, W.P. (2002).
-        SMOTE: Synthetic Minority Over-sampling Technique.
-        Journal of Artificial Intelligence Research, 16, 321-357.
     """
     unique, counts = np.unique(y_train, return_counts=True)
     min_count = counts.min()

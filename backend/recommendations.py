@@ -43,23 +43,22 @@ def generate_recommendations(
     
     if security_issues:
         high_sec = [s for s in security_issues if s.get("severity") == "HIGH"]
-        first_sec = security_issues[0]
+        sec_target = high_sec[0] if high_sec else security_issues[0]
         recs.append({
             "id": f"REC-{rec_counter:02d}",
             "category": "Security",
             "priority": "CRITICAL" if high_sec else "HIGH",
             "title": f"Remediate {len(security_issues)} Detected Security Anti-Pattern(s)",
             "action": (
-                f"Immediately review `{first_sec.get('filepath')}:{first_sec.get('lineno')}` "
-                f"({first_sec.get('title')}). Replace dynamic execution (eval/exec) or unsafe "
-                "subprocesses with parameterized alternatives."
+                f"In `{sec_target.get('filepath')}:{sec_target.get('lineno')}`: "
+                f"{sec_target.get('title')}. {sec_target.get('description', '')}"
             ),
-            "rationale": "Static security flaws create severe supply chain and runtime execution risks.",
+            "rationale": "Context-aware static security analysis flagged genuine injection or vulnerability risks.",
         })
         rec_counter += 1
 
     
-    # 2. Defect Hotspots & Complexity Outliers (P1 - HIGH)
+    # 2. Defect Hotspots & Complexity Outliers
     
     critical_complex = [c for c in complexity_issues if c.get("severity") == "CRITICAL"]
     if critical_complex:
@@ -93,7 +92,7 @@ def generate_recommendations(
         rec_counter += 1
 
 
-    # 3. Maintainability & Technical Debt (P1 - HIGH / P2 - MEDIUM)
+    # 3. Maintainability & Technical Debt
 
     if maintainability < 65.0 or maintainability_issues:
         worst_mi = maintainability_issues[0] if maintainability_issues else None
@@ -233,7 +232,7 @@ def generate_markdown_report(
     recommendations_data: dict[str, Any],
     ml_prediction: dict[str, Any] | None = None,
 ) -> str:
-    """Generates a complete, publication-quality Markdown audit report."""
+    
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rec_list = recommendations_data.get("recommendations", [])
     quick_wins = recommendations_data.get("quick_wins", [])

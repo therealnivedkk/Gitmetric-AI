@@ -162,6 +162,7 @@ class RiskAnalysisResult(Base):
     # Granular components stored as JSON
     hotspots_json = Column(Text, nullable=False)
     issues_json = Column(Text, nullable=True)
+    security_issues_json = Column(Text, nullable=True)
     recommendations_json = Column(Text, nullable=False)
     executive_summary = Column(Text, nullable=True)
 
@@ -175,6 +176,9 @@ class RiskAnalysisResult(Base):
 
     def get_hotspots(self) -> list[dict[str, Any]]:
         return json.loads(self.hotspots_json) if self.hotspots_json else []
+
+    def get_security_issues(self) -> list[dict[str, Any]]:
+        return json.loads(self.security_issues_json) if self.security_issues_json else []
 
     def get_recommendations(self) -> list[dict[str, Any]]:
         return json.loads(self.recommendations_json) if self.recommendations_json else []

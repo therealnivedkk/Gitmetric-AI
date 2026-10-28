@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from git import Repo
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,13 +28,11 @@ from ml_predictor import is_model_ready, predict
 from recommendations import generate_recommendations
 from scoring import calculate_rhi
 
-# ============================================================
-# FastAPI App Setup & CORS
-# ============================================================
 
+# FastAPI App Setup & CORS
 app = FastAPI(
     title="GitMetric AI API",
-    description="Automated Repository Health & Risk Assessment Platform",
+    description="Intelligent Repository Health & Risk Assessment Platform",
     version="1.0.0",
 )
 
@@ -77,27 +76,71 @@ def root():
 
 # 1. Main Pipeline: Analyze Repository
 
+def resolve_or_clone_repo(target: str) -> str:
+    target = target.strip()
+
+    is_git_url = (
+        target.startswith("http://")
+        or target.startswith("https://")
+        or target.startswith("git@")
+        or target.endswith(".git")
+        or "github.com/" in target
+        or "gitlab.com/" in target
+    )
+
+    if is_git_url:
+        url = target
+        if not url.startswith("http") and not url.startswith("git@"):
+            url = f"https://{url}"
+
+        # Extract repo name from URL
+        clean_url = url.rstrip("/")
+        if clean_url.endswith(".git"):
+            clean_url = clean_url[:-4]
+        repo_name = clean_url.split("/")[-1]
+
+        # Directory where cloned repositories live
+        base_repos_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "repositories"))
+        os.makedirs(base_repos_dir, exist_ok=True)
+        clone_dest = os.path.join(base_repos_dir, repo_name)
+
+        # If already cloned reuse
+        if os.path.isdir(clone_dest):
+            return clone_dest
+
+        try:
+            print(f"[GitMetric AI] Cloning repository from {url} into {clone_dest}...")
+            Repo.clone_from(url, clone_dest, depth=3000)
+            return clone_dest
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to clone repository from '{url}': {str(e)}",
+            )
+
+    # Otherwise, use local path
+    candidates = [
+        target,
+        os.path.abspath(target),
+        os.path.abspath(os.path.join("..", target)),
+        os.path.abspath(os.path.join("..", "repositories", target)),
+        os.path.abspath(os.path.join("repositories", target)),
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Repository not found at '{target}'. Please check the path or URL.",
+    )
 @app.post("/api/analyze")
 def analyze_repo_endpoint(
     req: AnalyzeRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Executes the full end-to-end analysis workflow:
-      1. Repository Mining (extractors.py)
-      2. Feature Engineering & RHI Scoring (scoring.py)
-      3. ML Classification & Feature Importance (ml_predictor.py)
-      4. Risk & Hotspot Detection (issues.py)
-      5. Actionable Recommendations (recommendations.py)
-      6. Persists Analysis, Prediction, and Risks in SQLite DB
-    """
-    repo_path = os.path.abspath(req.repo_path)
-    if not os.path.isdir(repo_path):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Repository path not found: {req.repo_path}",
-        )
+    repo_path = resolve_or_clone_repo(req.repo_path)
 
     # 1. Repository Analysis Module
     try:
@@ -108,7 +151,7 @@ def analyze_repo_endpoint(
             detail=f"Repository analysis failed: {str(exc)}",
         )
 
-    # 2. Feature Engineering & RHI Module
+    # 2. Feature Engineering Module
     score_data = calculate_rhi(extracted)
 
     # Combine scored object
@@ -166,7 +209,7 @@ def analyze_repo_endpoint(
         issues_data,
     )
 
-    # 6. Database Storage (Persist User Data, Analysis Data, Prediction Results)
+    # 6. Database Storage
     analysis_record = AnalysisResult(
         user_id=current_user.id,
         repo_name=extracted["repo_name"],
@@ -205,6 +248,7 @@ def analyze_repo_endpoint(
         summary_json=json.dumps(issues_data["summary"]),
         hotspots_json=json.dumps(issues_data["hotspots"]),
         issues_json=json.dumps(issues_data.get("complexity_issues", [])[:20]),
+        security_issues_json=json.dumps(issues_data.get("security_issues", [])),
         recommendations_json=json.dumps(recommendations_data["recommendations"]),
         executive_summary=recommendations_data["executive_summary"],
     )
@@ -313,6 +357,7 @@ def get_analysis_by_id(
         "issues": {
             "summary": risk.get_summary() if risk else {},
             "hotspots": risk.get_hotspots() if risk else [],
+            "security_issues": risk.get_security_issues() if risk else [],
         },
         "recommendations": {
             "executive_summary": risk.executive_summary if risk else "",

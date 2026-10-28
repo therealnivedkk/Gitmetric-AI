@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import {
   Chart as ChartJS,
@@ -10,23 +10,135 @@ import {
   Legend,
 } from 'chart.js';
 import { Bar } from 'react-chartjs-2';
+import './App.css';
 
 ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
 
 const API_BASE = 'http://localhost:8000';
+// Matches FastAPI route @app.get("/api/analyses")
+const HISTORY_ENDPOINT = `${API_BASE}/api/analyses`;
+
+const EXAMPLE_REPOS = ['../repositories/tqdm', '../repositories/arrow', 'https://github.com/pallets/flask'];
+
+const GAUGE_RADIUS = 54;
+const GAUGE_CIRCUMFERENCE = 2 * Math.PI * GAUGE_RADIUS;
+
+// Sidebar structure. `badge` keys are resolved against live data in the component.
+const NAV_SECTIONS = [
+  {
+    title: 'Workspace',
+    items: [
+      { id: 'scanner',  label: 'Repository Scanner', needsData: false },
+      { id: 'overview', label: 'Health Overview', needsData: true },
+    ],
+  },
+  {
+    title: 'Deep Analytics',
+    items: [
+      { id: 'ml', label: 'ML Explainability', needsData: true },
+      { id: 'hotspots', label: 'Hotspot Matrix', needsData: true, badge: 'hotspots' },
+      { id: 'security', label: 'Security Findings', needsData: true, badge: 'security' },
+      { id: 'recs', label: 'Recommendations', needsData: true, badge: 'recs' },
+    ],
+  },
+  {
+    title: 'History & Export',
+    items: [
+      { id: 'history', label: 'Scan History', needsData: false, badge: 'history' },
+      { id: 'export', label: 'Export Reports', needsData: true },
+    ],
+  },
+];
+
+const VIEW_META = {
+  scanner: ['Repository Scanner', 'Ingest a local path or GitHub URL and run a scan'],
+  overview: ['Health Overview', 'Repository Health Index and core pillars'],
+  ml: ['ML Explainability', 'What the Random Forest model weighed, and how confident it is'],
+  hotspots: ['Hotspot Matrix', 'Churn × complexity — where defects are most likely to cluster'],
+  security: ['Security Findings', 'AST-based anti-patterns and leaked secrets'],
+  recs: ['Recommendations', 'Prioritized remediation actions'],
+  history: ['Scan History', 'Previously analyzed repositories'],
+  export: ['Export Reports', 'Download this analysis as a shareable report'],
+};
+
+// Normalizes any health label (RHI label or ML label) to one of three bands.
+function bandOf(label) {
+  if (!label) return 'stable';
+  const l = label.toLowerCase();
+  if (l.includes('health')) return 'healthy';
+  if (l.includes('stable')) return 'stable';
+  return 'needs-attention';
+}
+
+const isGithubUrl = (s) => /^(https?:\/\/)?(www\.)?github\.com\/[^/\s]+\/[^/\s]+/i.test(s.trim()) || /^git@github\.com:/i.test(s.trim());
 
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem('token') || '');
   const [user, setUser] = useState(localStorage.getItem('username') || '');
   const [isRegister, setIsRegister] = useState(false);
-
-  // Form states
   const [authForm, setAuthForm] = useState({ username: '', email: '', password: '' });
-  const [repoPath, setRepoPath] = useState('.....enter the path');
+
+  const [repoPath, setRepoPath] = useState('');
+  const [shallowClone, setShallowClone] = useState(true);
+  const [branch, setBranch] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [data, setData] = useState(null);
-  const [activeTab, setActiveTab] = useState('overview');
+  const [apiState, setApiState] = useState('unknown'); // unknown | connected | offline
+
+  const [view, setView] = useState('scanner');
+  const [collapsed, setCollapsed] = useState(false); // desktop icon-only mode
+  const [drawerOpen, setDrawerOpen] = useState(false); // mobile off-canvas
+  const [gaugeReady, setGaugeReady] = useState(false);
+
+  const [history, setHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+
+  const abortRef = useRef(null);
+  const viewRef = useRef(null);
+
+  // Animate the gauge whenever a new result arrives or the overview is shown
+  useEffect(() => {
+    setGaugeReady(false);
+    if (data && view === 'overview') {
+      const t = setTimeout(() => setGaugeReady(true), 80);
+      return () => clearTimeout(t);
+    }
+  }, [data, view]);
+
+  // Scroll the content area back to the top when switching views
+  useEffect(() => {
+    if (viewRef.current) viewRef.current.scrollTop = 0;
+  }, [view]);
+
+  const authHeaders = useCallback(() => ({ Authorization: `Bearer ${token}` }), [token]);
+
+  const fetchHistory = useCallback(async () => {
+    if (!token) return;
+    setHistoryLoading(true);
+    setHistoryError('');
+    try {
+      const res = await axios.get(HISTORY_ENDPOINT, { headers: authHeaders() });
+      const rows = Array.isArray(res.data) ? res.data : res.data?.items || res.data?.history || [];
+      setHistory(rows);
+      setApiState('connected');
+    } catch (err) {
+      if (err.request && !err.response) setApiState('offline');
+      setHistoryError(
+        err.response?.status === 404
+          ? 'History endpoint not found on the API yet.'
+          : err.response?.data?.detail || 'Could not load scan history.'
+      );
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [token, authHeaders]);
+
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
 
   const handleAuth = async (e) => {
     e.preventDefault();
@@ -35,7 +147,7 @@ export default function App() {
       if (isRegister) {
         await axios.post(`${API_BASE}/auth/register`, authForm);
         setIsRegister(false);
-        setError('Registration successful! Please login.');
+        setError('Registration successful — please sign in.');
       } else {
         const res = await axios.post(`${API_BASE}/auth/login`, {
           username: authForm.username,
@@ -46,37 +158,109 @@ export default function App() {
         setUser(authForm.username);
         localStorage.setItem('token', jwt);
         localStorage.setItem('username', authForm.username);
+        setView('scanner');
       }
     } catch (err) {
+      if (err.request && !err.response) setApiState('offline');
       setError(err.response?.data?.detail || 'Authentication failed');
     }
   };
 
   const handleLogout = () => {
+    abortRef.current?.abort();
     setToken('');
     setUser('');
     setData(null);
+    setHistory([]);
+    setView('scanner');
+    setApiState('unknown');
     localStorage.removeItem('token');
     localStorage.removeItem('username');
   };
 
   const runAnalysis = async () => {
-    if (!repoPath) return;
+    const target = repoPath.trim();
+    if (!target || loading) return;
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    setLoading(true);
+    setError('');
+    setNotice('');
+
+    const fromGithub = isGithubUrl(target);
+    // `repo_path` carries either a local path or a GitHub URL. The extra fields are hints
+    // for the backend's clone step and are ignored by APIs that don't declare them.
+    const payload = { repo_path: target };
+    if (fromGithub) {
+      payload.source = 'github';
+      payload.shallow = shallowClone;
+      if (branch.trim()) payload.branch = branch.trim();
+    }
+
+    try {
+      const res = await axios.post(`${API_BASE}/api/analyze`, payload, {
+        headers: authHeaders(),
+        signal: controller.signal,
+      });
+      setData(res.data);
+      setApiState('connected');
+      setView('overview');
+      fetchHistory();
+    } catch (err) {
+      if (axios.isCancel(err) || err.code === 'ERR_CANCELED') {
+        setNotice('Scan cancelled.');
+      } else {
+        if (err.request && !err.response) setApiState('offline');
+        setError(
+          err.response?.data?.detail ||
+            (fromGithub
+              ? 'Analysis failed. Check the GitHub URL, branch, and that the repo is public.'
+              : 'Analysis failed. Verify the repository path and try again.')
+        );
+      }
+    } finally {
+      setLoading(false);
+      abortRef.current = null;
+    }
+  };
+
+  const cancelAnalysis = () => abortRef.current?.abort();
+
+  const loadPastAnalysis = async (analysisId) => {
+    if (!analysisId) return;
     setLoading(true);
     setError('');
     try {
-      const res = await axios.post(
-        `${API_BASE}/api/analyze`,
-        { repo_path: repoPath },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      const res = await axios.get(`${API_BASE}/api/analyses/${analysisId}`, {
+        headers: authHeaders(),
+      });
       setData(res.data);
-      setActiveTab('overview');
+      setRepoPath(res.data.repo_path || res.data.repo_name || '');
+      setView('overview');
+      setDrawerOpen(false);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Analysis failed. Please verify the repository path.');
+      setError(err.response?.data?.detail || 'Failed to load past analysis.');
     } finally {
       setLoading(false);
     }
+  };
+
+  const openFromHistory = (row) => {
+    if (row.id) {
+      loadPastAnalysis(row.id);
+    } else {
+      const path = row.repo_path || row.repo_url || row.path || row.repo_name || '';
+      setRepoPath(path);
+      setView('scanner');
+      setDrawerOpen(false);
+    }
+  };
+
+  const goTo = (id) => {
+    setView(id);
+    setDrawerOpen(false);
   };
 
   const downloadPdfReport = () => {
@@ -88,22 +272,22 @@ export default function App() {
       <head>
         <title>GitMetric AI Audit - ${data.repo_name}</title>
         <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #212529; margin: 30px; font-size: 13px; line-height: 1.5; }
-          h1, h2, h3, h4 { color: #0d6efd; margin-top: 0; }
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #14161b; margin: 30px; font-size: 13px; line-height: 1.5; }
+          h1, h2, h3, h4 { color: #b3760f; margin-top: 0; }
           .header { border-bottom: 2px solid #dee2e6; padding-bottom: 12px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: flex-end; }
           .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size: 12px; }
-          .badge-healthy { background: #d1e7dd; color: #0f5132; }
-          .badge-stable { background: #cff4fc; color: #055160; }
-          .badge-needs { background: #fff3cd; color: #664d03; }
+          .badge-healthy { background: #d1f5e4; color: #0f7a4f; }
+          .badge-stable { background: #dcecff; color: #1c5fa8; }
+          .badge-needs { background: #ffe1e5; color: #b3283b; }
           .score-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
           .score-box { border: 1px solid #ced4da; border-radius: 6px; padding: 10px; text-align: center; }
           .score-val { font-size: 22px; font-weight: bold; margin: 4px 0; }
           table { width: 100%; border-collapse: collapse; margin: 15px 0; font-size: 12px; }
           th, td { border: 1px solid #dee2e6; padding: 6px 10px; text-align: left; }
           th { background-color: #f8f9fa; }
-          .rec-item { border-left: 4px solid #0d6efd; background: #fdfdfd; padding: 8px 12px; margin-bottom: 10px; border-radius: 0 4px 4px 0; }
+          .rec-item { border-left: 4px solid #b3760f; background: #fdfdfd; padding: 8px 12px; margin-bottom: 10px; border-radius: 0 4px 4px 0; }
           .rec-item.CRITICAL { border-left-color: #dc3545; }
-          .rec-item.HIGH { border-left-color: #ffc107; }
+          .rec-item.HIGH { border-left-color: #ea580c; }
         </style>
       </head>
       <body>
@@ -113,7 +297,7 @@ export default function App() {
             <div><strong>Repository:</strong> <code>${data.repo_name}</code> | <strong>Scanned:</strong> ${new Date().toLocaleDateString()}</div>
           </div>
           <div style="text-align: right;">
-            <div style="font-size: 28px; font-weight: bold; color: #0d6efd;">${data.scores.overall_rhi} / 100</div>
+            <div style="font-size: 28px; font-weight: bold; color: #b3760f;">${data.scores.overall_rhi} / 100</div>
             <span class="badge ${data.scores.label === 'Healthy' ? 'badge-healthy' : data.scores.label === 'Stable' ? 'badge-stable' : 'badge-needs'}">
               ${data.scores.label}
             </span>
@@ -217,16 +401,8 @@ ${data.recommendations?.recommendations?.map(r => `### [${r.priority}] ${r.title
     a.download = `${data.repo_name}_gitmetric_report.md`;
     a.click();
   };
-
-  const getBadgeClass = (label) => {
-    if (label === 'Healthy') return 'bg-success';
-    if (label === 'Stable') return 'bg-primary';
-    return 'bg-warning text-dark';
-  };
-
   // Prepare ML Explainability Feature Importances for Chart.js
-  const topFeatures = Object.entries(data?.ml_prediction?.feature_contributions || {})
-    .slice(0, 8);
+  const topFeatures = Object.entries(data?.ml_prediction?.feature_contributions || {}).slice(0, 8);
 
   const featureChartData = {
     labels: topFeatures.map(([k]) => k),
@@ -234,9 +410,10 @@ ${data.recommendations?.recommendations?.map(r => `### [${r.priority}] ${r.title
       {
         label: 'Feature Importance Weight',
         data: topFeatures.map(([, v]) => v),
-        backgroundColor: 'rgba(13, 110, 253, 0.75)',
-        borderColor: 'rgba(13, 110, 253, 1)',
+        backgroundColor: 'rgba(255, 176, 32, 0.75)',
+        borderColor: 'rgba(255, 176, 32, 1)',
         borderWidth: 1,
+        borderRadius: 3,
       },
     ],
   };
@@ -247,357 +424,568 @@ ${data.recommendations?.recommendations?.map(r => `### [${r.priority}] ${r.title
     maintainAspectRatio: false,
     plugins: {
       legend: { display: false },
-      tooltip: { callbacks: { label: (ctx) => `Weight: ${(ctx.raw * 100).toFixed(2)}%` } },
+      tooltip: {
+        backgroundColor: '#171b24',
+        borderColor: '#232836',
+        borderWidth: 1,
+        titleColor: '#e9ecf2',
+        bodyColor: '#8991a3',
+        titleFont: { family: "'JetBrains Mono', monospace", size: 11 },
+        bodyFont: { family: "'JetBrains Mono', monospace", size: 11 },
+        callbacks: { label: (ctx) => `weight: ${(ctx.raw * 100).toFixed(2)}%` },
+      },
     },
     scales: {
-      x: { beginAtZero: true, max: 0.20 },
+      x: {
+        beginAtZero: true,
+        max: 0.2,
+        grid: { color: '#1c2129' },
+        ticks: { color: '#565e70', font: { family: "'JetBrains Mono', monospace", size: 10 } },
+      },
+      y: {
+        grid: { display: false },
+        ticks: { color: '#8991a3', font: { family: "'JetBrains Mono', monospace", size: 10 } },
+      },
     },
   };
 
-  // Authentication Screen
+  // -----------------------------------------------------------------
+  // Auth screen (full-screen, no sidebar)
+  // -----------------------------------------------------------------
   if (!token) {
     return (
-      <div className="container mt-5" style={{ maxWidth: 450 }}>
-        <div className="card shadow-sm p-4 border-0">
-          <div className="text-center mb-3">
-            <h2 className="text-primary fw-bold">GitMetric AI</h2>
-            <p className="text-muted small">Autonomous Repository Health & Risk Assessment</p>
-          </div>
-          {error && <div className="alert alert-danger py-2 small">{error}</div>}
-          <form onSubmit={handleAuth}>
-            <div className="mb-3">
-              <label className="form-label small fw-bold">Username</label>
-              <input
-                type="text"
-                className="form-control"
-                required
-                value={authForm.username}
-                onChange={(e) => setAuthForm({ ...authForm, username: e.target.value })}
-              />
+      <div className="auth-screen">
+        <div className="auth-frame">
+          <div className="auth-logo">
+            <div className="brand">
+              <span className="brand-dot" />
+              <span className="brand-mark">Git<span className="accent">Metric AI</span></span>
             </div>
-            {isRegister && (
-              <div className="mb-3">
-                <label className="form-label small fw-bold">Email</label>
+            <p>Intelligent repository health &amp; risk assessment platform</p>
+          </div>
+          <div className="auth-card">
+            <h3>{isRegister ? 'Create an account' : 'Sign in'}</h3>
+            <p className="hint">
+              {isRegister ? 'Register to start scanning repositories.' : 'Enter your credentials to continue.'}
+            </p>
+            {error && <div className="error-banner">{error}</div>}
+            <form onSubmit={handleAuth}>
+              <div className="field">
+                <label>Username</label>
                 <input
-                  type="email"
-                  className="form-control"
+                  type="text"
                   required
-                  value={authForm.email}
-                  onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
+                  value={authForm.username}
+                  onChange={(e) => setAuthForm({ ...authForm, username: e.target.value })}
                 />
               </div>
-            )}
-            <div className="mb-3">
-              <label className="form-label small fw-bold">Password</label>
-              <input
-                type="password"
-                className="form-control"
-                required
-                value={authForm.password}
-                onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
-              />
+              {isRegister && (
+                <div className="field">
+                  <label>Email</label>
+                  <input
+                    type="email"
+                    required
+                    value={authForm.email}
+                    onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
+                  />
+                </div>
+              )}
+              <div className="field">
+                <label>Password</label>
+                <input
+                  type="password"
+                  required
+                  value={authForm.password}
+                  onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
+                />
+              </div>
+              <button className="btn-primary" type="submit">
+                {isRegister ? 'Register' : 'Sign in'}
+              </button>
+            </form>
+            <div className="auth-switch">
+              {isRegister ? 'Already have an account?' : "Don't have an account?"}{' '}
+              <button onClick={() => { setIsRegister(!isRegister); setError(''); }}>
+                {isRegister ? 'Sign in' : 'Register'}
+              </button>
             </div>
-            <button className="btn btn-primary w-100 mb-2" type="submit">
-              {isRegister ? 'Register' : 'Login'}
-            </button>
-            <button
-              type="button"
-              className="btn btn-link w-100 text-decoration-none small"
-              onClick={() => { setIsRegister(!isRegister); setError(''); }}
-            >
-              {isRegister ? 'Already have an account? Sign in' : "Don't have an account? Register"}
-            </button>
-          </form>
+          </div>
         </div>
       </div>
     );
   }
 
-  return (
-    <div className="container py-4">
-      {/* Top Navbar */}
-      <div className="d-flex justify-content-between align-items-center mb-4 pb-2 border-bottom">
-        <div>
-          <h3 className="text-primary fw-bold mb-0">GitMetric AI</h3>
-          <small className="text-muted">Repository Health & Risk Assessment Platform</small>
-        </div>
-        <div className="d-flex align-items-center gap-3">
-          <span className="badge bg-light text-dark border px-3 py-2">👤 {user}</span>
-          <button className="btn btn-outline-danger btn-sm" onClick={handleLogout}>Logout</button>
-        </div>
-      </div>
+  // -----------------------------------------------------------------
+  // Derived values
+  // -----------------------------------------------------------------
+  const rhiBand = data ? bandOf(data.scores.label) : 'stable';
+  const gaugeOffset = gaugeReady
+    ? GAUGE_CIRCUMFERENCE - ((data?.scores?.overall_rhi || 0) / 100) * GAUGE_CIRCUMFERENCE
+    : GAUGE_CIRCUMFERENCE;
 
-      {/* Analysis Input Bar */}
-      <div className="card shadow-sm p-3 mb-4 border-0">
-        <label className="form-label small text-muted fw-bold">Enter Target Repository Path</label>
-        <div className="row g-2 align-items-center">
-          <div className="col">
+  const hotspots = data?.issues?.hotspots || [];
+  const securityIssues = data?.issues?.security_issues || [];
+  const recList = data?.recommendations?.recommendations || [];
+
+  const badgeValues = {
+    hotspots: data ? hotspots.length : null,
+    security: data ? securityIssues.length : null,
+    recs: data ? data.recommendations?.total_recommendations ?? recList.length : null,
+    history: history.length || null,
+  };
+
+  const status = loading
+    ? { cls: 'scanning', text: 'Scanning…' }
+    : apiState === 'offline'
+      ? { cls: 'offline', text: 'API offline' }
+      : apiState === 'connected'
+        ? { cls: 'connected', text: 'API connected' }
+        : { cls: 'idle', text: 'Idle' };
+
+  const [viewTitle, viewSubtitle] = VIEW_META[view];
+  const sourceKind = repoPath.trim() ? (isGithubUrl(repoPath) ? 'github' : 'local') : null;
+
+  const severityOf = (sec) => {
+    const s = (sec.severity || '').toLowerCase();
+    if (s.startsWith('high') || s.startsWith('crit')) return 'high';
+    if (s.startsWith('low')) return 'low';
+    return 'medium';
+  };
+
+  const EmptyData = () => (
+    <div className="empty-state">
+      <span className="caret-blink">▍</span>
+      <p>No analysis loaded yet. Scan a repository to see this view.</p>
+      <button className="btn-run empty-cta" onClick={() => goTo('scanner')}>Go to Repository Scanner</button>
+    </div>
+  );
+
+  // -----------------------------------------------------------------
+  // Views
+  // -----------------------------------------------------------------
+  const renderScanner = () => (
+    <>
+      <div className={`scan-panel ${loading ? 'is-scanning' : ''}`}>
+        <span className="scan-label">target repository</span>
+        <div className="scan-row">
+          <div className="scan-prompt">
+            <span className="caret">$</span>
             <input
               type="text"
-              className="form-control"
-              placeholder="e.g. ../repositories/tqdm or ../repositories/arrow"
+              placeholder="../repositories/repo_name  or  https://github.com/owner/repo"
               value={repoPath}
+              disabled={loading}
               onChange={(e) => setRepoPath(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && runAnalysis()}
             />
+            {sourceKind && <span className={`source-tag ${sourceKind}`}>{sourceKind === 'github' ? 'GitHub URL' : 'Local path'}</span>}
           </div>
-          <div className="col-auto">
-            <button className="btn btn-primary px-4 fw-bold" onClick={runAnalysis} disabled={loading}>
-              {loading ? 'Analyzing...' : 'Run Analysis'}
-            </button>
-          </div>
+          {loading ? (
+            <button className="btn-cancel" onClick={cancelAnalysis}>Cancel scan</button>
+          ) : (
+            <button className="btn-run" onClick={runAnalysis} disabled={!repoPath.trim()}>Run analysis</button>
+          )}
         </div>
-        {error && <div className="alert alert-danger mt-3 mb-0 py-2 small">{error}</div>}
+
+        {sourceKind === 'github' && (
+          <div className="clone-options">
+            <label className="check">
+              <input type="checkbox" checked={shallowClone} disabled={loading} onChange={(e) => setShallowClone(e.target.checked)} />
+              Shallow clone (faster, recent history only)
+            </label>
+            <label className="branch-field">
+              Branch
+              <input type="text" placeholder="default branch" value={branch} disabled={loading} onChange={(e) => setBranch(e.target.value)} />
+            </label>
+          </div>
+        )}
+
+        <div className="quick-paths">
+          <span>Try:</span>
+          {EXAMPLE_REPOS.map((path) => (
+            <button key={path} disabled={loading} onClick={() => setRepoPath(path)}>{path.replace('https://github.com/', 'gh:')}</button>
+          ))}
+        </div>
+        {error && <div className="error-banner">{error}</div>}
+        {notice && <div className="notice-banner">{notice}</div>}
       </div>
 
-      {/* Results View */}
-      {data && (
-        <>
-          {/* Hero Verdict Banner */}
-          <div className="card shadow-sm p-4 mb-4 border-0 bg-white">
-            <div className="row align-items-center">
-              <div className="col-md-7">
-                <span className="text-uppercase text-muted small fw-bold">Repository Audit</span>
-                <h2 className="fw-bold mb-2 text-dark">{data.repo_name}</h2>
-                <div className="d-flex gap-3 mb-3">
-                  <div>RHI Label: <span className={`badge ${getBadgeClass(data.scores.label)} ms-1`}>{data.scores.label}</span></div>
-                  <div>ML Prediction: <span className={`badge ${getBadgeClass(data.ml_prediction?.ml_label)} ms-1`}>{data.ml_prediction?.ml_label}</span></div>
-                </div>
-                <p className="text-secondary small mb-0">{data.recommendations?.executive_summary}</p>
-              </div>
-              <div className="col-md-5 text-md-end text-center mt-3 mt-md-0">
-                <div className="display-4 fw-bold text-primary">{data.scores.overall_rhi}</div>
-                <div className="text-muted small">Repository Health Index (RHI / 100)</div>
-                <div className="mt-3 d-flex justify-content-md-end justify-content-center gap-2">
-                  <button className="btn btn-outline-secondary btn-sm" onClick={downloadMarkdownReport}>
-                    Markdown (.md)
-                  </button>
-                  <button className="btn btn-outline-primary btn-sm" onClick={downloadPdfReport}>
-                    Export PDF
-                  </button>
-                </div>
-              </div>
+      {data && !loading && (
+        <div className="panel last-scan">
+          <div>
+            <h5>Last scan: <span className="mono">{data.repo_name}</span></h5>
+            <p className="panel-desc" style={{ marginBottom: 0 }}>RHI {data.scores.overall_rhi}/100 · {data.scores.label}</p>
+          </div>
+          <button className="btn-ghost" onClick={() => goTo('overview')}>Open health overview</button>
+        </div>
+      )}
+
+      {!data && !loading && (
+        <div className="empty-state">
+          <span className="caret-blink">▍</span>
+          <p>No scan yet — enter a repository path or GitHub URL and run an analysis.</p>
+        </div>
+      )}
+    </>
+  );
+
+  const renderOverview = () => (
+    <>
+      <div className="verdict">
+        <div>
+          <span className="verdict-eyebrow">repository audit</span>
+          <h2>{data.repo_name}</h2>
+          <div className="verdict-pills">
+            <span className={`pill ${rhiBand}`}>RHI: {data.scores.label}</span>
+            <span className={`pill ${bandOf(data.ml_prediction?.ml_label)}`}>ML: {data.ml_prediction?.ml_label}</span>
+          </div>
+          <p className="verdict-summary">{data.recommendations?.executive_summary}</p>
+        </div>
+        <div className="gauge-block">
+          <div className="gauge">
+            <svg viewBox="0 0 128 128">
+              <circle className="gauge-track" cx="64" cy="64" r={GAUGE_RADIUS} />
+              <circle
+                className={`gauge-fill ${rhiBand}`}
+                cx="64"
+                cy="64"
+                r={GAUGE_RADIUS}
+                strokeDasharray={GAUGE_CIRCUMFERENCE}
+                strokeDashoffset={gaugeOffset}
+              />
+            </svg>
+            <div className="gauge-value">
+              <span className="num">{data.scores.overall_rhi}</span>
+              <span className="denom">/ 100</span>
             </div>
           </div>
+          <span className="gauge-caption">Repository Health Index</span>
+        </div>
+      </div>
 
-          {/* Navigation Tabs */}
-          <ul className="nav nav-pills mb-4">
-            <li className="nav-item">
-              <button
-                className={`nav-link ${activeTab === 'overview' ? 'active fw-bold' : ''}`}
-                onClick={() => setActiveTab('overview')}
-              >
-                Overview & Sub-Scores
-              </button>
-            </li>
-            <li className="nav-item">
-              <button
-                className={`nav-link ${activeTab === 'explainability' ? 'active fw-bold' : ''}`}
-                onClick={() => setActiveTab('explainability')}
-              >
-                ML Explainability (Feature Weights)
-              </button>
-            </li>
-            <li className="nav-item">
-              <button
-                className={`nav-link ${activeTab === 'hotspots' ? 'active fw-bold' : ''}`}
-                onClick={() => setActiveTab('hotspots')}
-              >
-                Hotspots & Issues ({data.issues?.summary?.critical + data.issues?.summary?.high} High/Crit)
-              </button>
-            </li>
-            <li className="nav-item">
-              <button
-                className={`nav-link ${activeTab === 'recommendations' ? 'active fw-bold' : ''}`}
-                onClick={() => setActiveTab('recommendations')}
-              >
-                Actionable Recommendations ({data.recommendations?.total_recommendations})
-              </button>
-            </li>
+      <div className="score-grid">
+        {[
+          ['Code quality', data.scores.code_quality_score, 'McCabe bands'],
+          ['Maintainability', data.scores.maintainability_score, 'Radon MI'],
+          ['Development activity', data.scores.development_score, `${data.aggregates.contributors} contributors`],
+          ['Change risk', data.scores.change_risk_score, `${data.aggregates.total_churn?.toLocaleString()} churn lines`],
+        ].map(([label, value, meta]) => (
+          <div className="score-card" key={label}>
+            <div className="label">{label}</div>
+            <div className="value">{value}<span>/100</span></div>
+            <div className="score-track"><div className="fill" style={{ width: `${value}%` }} /></div>
+            <div className="meta">{meta}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid-2">
+        <div className="panel">
+          <h5>Repository metrics</h5>
+          <p className="panel-desc">Snapshot pulled from the latest scan</p>
+          <table className="kv-table">
+            <tbody>
+              <tr><td>Total LOC</td><td>{data.aggregates.total_loc?.toLocaleString()}</td></tr>
+              <tr><td>Python files</td><td>{data.aggregates.file_count}</td></tr>
+              <tr><td>Avg cyclomatic complexity</td><td>{data.aggregates.avg_cc}</td></tr>
+              <tr><td>Documentation coverage</td><td>{data.aggregates.documentation_coverage}%</td></tr>
+              <tr><td>Total commits</td><td>{data.aggregates.commit_count} ({data.aggregates.commit_freq}/wk)</td></tr>
+              <tr><td>Top-3 churn concentration</td><td>{(data.aggregates.churn_concentration * 100).toFixed(1)}%</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div className="panel">
+          <h5>Quick wins</h5>
+          <p className="panel-desc">Fastest changes to move the needle</p>
+          <ul className="quickwin-list">
+            {data.recommendations?.quick_wins?.map((win, i) => (
+              <li key={i}>
+                <span className="quickwin-num">{i + 1}</span>
+                <span>{win}</span>
+              </li>
+            ))}
           </ul>
+        </div>
+      </div>
+    </>
+  );
 
-          {/* TAB 1: Overview */}
-          {activeTab === 'overview' && (
-            <>
-              {/* 4 Core Sub-Scores */}
-              <div className="row g-3 mb-4">
-                <div className="col-md-3">
-                  <div className="card shadow-sm text-center p-3 border-0 bg-white">
-                    <small className="text-muted">Code Quality Score</small>
-                    <h2 className="fw-bold my-1 text-dark">{data.scores.code_quality_score}</h2>
-                    <small className="text-success">McCabe Bands (0-100)</small>
-                  </div>
-                </div>
-                <div className="col-md-3">
-                  <div className="card shadow-sm text-center p-3 border-0 bg-white">
-                    <small className="text-muted">Maintainability Score</small>
-                    <h2 className="fw-bold my-1 text-dark">{data.scores.maintainability_score}</h2>
-                    <small className="text-info">Radon MI Index</small>
-                  </div>
-                </div>
-                <div className="col-md-3">
-                  <div className="card shadow-sm text-center p-3 border-0 bg-white">
-                    <small className="text-muted">Development Activity</small>
-                    <h2 className="fw-bold my-1 text-dark">{data.scores.development_score}</h2>
-                    <small className="text-primary">{data.aggregates.contributors} Contributors</small>
-                  </div>
-                </div>
-                <div className="col-md-3">
-                  <div className="card shadow-sm text-center p-3 border-0 bg-white">
-                    <small className="text-muted">Change Risk Score</small>
-                    <h2 className="fw-bold my-1 text-dark">{data.scores.change_risk_score}</h2>
-                    <small className="text-secondary">{data.aggregates.total_churn?.toLocaleString()} Churn lines</small>
-                  </div>
-                </div>
-              </div>
-
-              {/* Metrics & Quick Wins */}
-              <div className="row g-4 mb-4">
-                <div className="col-md-6">
-                  <div className="card shadow-sm p-3 h-100 border-0 bg-white">
-                    <h5 className="fw-bold mb-3">Repository Metrics Snapshot</h5>
-                    <table className="table table-sm table-borderless small mb-0">
-                      <tbody>
-                        <tr><td><strong>Total LOC:</strong></td><td>{data.aggregates.total_loc?.toLocaleString()} lines</td></tr>
-                        <tr><td><strong>Python Files:</strong></td><td>{data.aggregates.file_count} files</td></tr>
-                        <tr><td><strong>Avg Cyclomatic Complexity:</strong></td><td>{data.aggregates.avg_cc}</td></tr>
-                        <tr><td><strong>Documentation Coverage:</strong></td><td>{data.aggregates.documentation_coverage}%</td></tr>
-                        <tr><td><strong>Total Commits:</strong></td><td>{data.aggregates.commit_count} ({data.aggregates.commit_freq} / week)</td></tr>
-                        <tr><td><strong>Top 3 Churn Concentration:</strong></td><td>{(data.aggregates.churn_concentration * 100).toFixed(1)}%</td></tr>
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-                <div className="col-md-6">
-                  <div className="card shadow-sm p-3 h-100 border-0 bg-white">
-                    <h5 className="fw-bold mb-3">⚡ Quick Wins</h5>
-                    <ul className="list-group list-group-flush small">
-                      {data.recommendations?.quick_wins?.map((win, i) => (
-                        <li key={i} className="list-group-item px-0">
-                          <span className="badge bg-primary me-2">{i + 1}</span> {win}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-
-          {/* TAB 2: ML Explainability */}
-          {activeTab === 'explainability' && (
-            <div className="row g-4 mb-4">
-              <div className="col-md-7">
-                <div className="card shadow-sm p-3 border-0 bg-white h-100">
-                  <h5 className="fw-bold mb-2">Corpus Feature Importances</h5>
-                  <small className="text-muted mb-3 d-block">
-                    Trained Random Forest relative feature weights (Module 7)
-                  </small>
-                  <div style={{ height: 320 }}>
-                    <Bar data={featureChartData} options={featureChartOptions} />
-                  </div>
-                </div>
-              </div>
-              <div className="col-md-5">
-                <div className="card shadow-sm p-3 border-0 bg-white h-100">
-                  <h5 className="fw-bold mb-2">ML Prediction Probabilities</h5>
-                  <small className="text-muted mb-3 d-block">Confidence distribution across the 3 health classes</small>
-                  {Object.entries(data.ml_prediction?.confidence || {}).map(([label, prob]) => (
-                    <div key={label} className="mb-3">
-                      <div className="d-flex justify-content-between small fw-bold mb-1">
-                        <span>{label}</span>
-                        <span>{(prob * 100).toFixed(1)}%</span>
-                      </div>
-                      <div className="progress" style={{ height: 10 }}>
-                        <div
-                          className={`progress-bar ${label === 'Healthy' ? 'bg-success' : label === 'Stable' ? 'bg-primary' : 'bg-warning'}`}
-                          style={{ width: `${prob * 100}%` }}
-                        />
-                      </div>
-                    </div>
-                  ))}
-                  <div className="alert alert-light border small mt-4 mb-0">
-                    <strong>Model Type:</strong> RandomForestClassifier (SMOTE-Balanced, 200 Estimators)
-                  </div>
-                </div>
-              </div>
+  const renderML = () => (
+    <div className="grid-2">
+      <div className="panel">
+        <h5>Feature importances</h5>
+        <p className="panel-desc">Trained Random Forest relative feature weights</p>
+        <div className="chart-box">
+          <Bar data={featureChartData} options={featureChartOptions} />
+        </div>
+      </div>
+      <div className="panel">
+        <h5>Prediction probabilities</h5>
+        <p className="panel-desc">Confidence across the three health classes</p>
+        {Object.entries(data.ml_prediction?.confidence || {}).map(([label, prob]) => (
+          <div key={label} className="prob-row">
+            <div className="prob-row-head">
+              <span>{label}</span>
+              <span className="val">{(prob * 100).toFixed(1)}%</span>
             </div>
-          )}
-
-          {/* TAB 3: Hotspots & Issues */}
-          {activeTab === 'hotspots' && (
-            <>
-              <div className="card shadow-sm p-3 mb-4 border-0 bg-white">
-                <h5 className="fw-bold mb-3">Defect Hotspots (High Churn × High Complexity)</h5>
-                <div className="table-responsive">
-                  <table className="table table-hover align-middle small mb-0">
-                    <thead className="table-light">
-                      <tr>
-                        <th>Rank</th>
-                        <th>File Path</th>
-                        <th>Churn (Lines)</th>
-                        <th>Avg CC</th>
-                        <th>Max CC</th>
-                        <th>Hotspot Score</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {data.issues.hotspots.map((h, i) => (
-                        <tr key={i}>
-                          <td><span className="badge bg-secondary">{i + 1}</span></td>
-                          <td><code>{h.filepath}</code></td>
-                          <td>{h.churn}</td>
-                          <td>{h.avg_cc}</td>
-                          <td><span className={`badge ${h.max_cc > 20 ? 'bg-danger' : 'bg-warning text-dark'}`}>{h.max_cc}</span></td>
-                          <td><strong>{h.hotspot_score}</strong></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              {/* Security Alerts */}
-              {data.issues.security_issues?.length > 0 && (
-                <div className="card shadow-sm p-3 mb-4 border-0 bg-white">
-                  <h5 className="fw-bold text-danger mb-3">⚠️ Detected Security Anti-Patterns</h5>
-                  <div className="list-group">
-                    {data.issues.security_issues.map((sec, i) => (
-                      <div key={i} className="list-group-item list-group-item-danger mb-2 rounded">
-                        <div className="fw-bold">{sec.title} ({sec.rule_id})</div>
-                        <small>File: <code>{sec.filepath}:{sec.lineno}</code></small>
-                        <p className="small mb-0 mt-1">{sec.description}</p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-
-          {/* TAB 4: Recommendations */}
-          {activeTab === 'recommendations' && (
-            <div className="card shadow-sm p-4 border-0 bg-white mb-4">
-              <h5 className="fw-bold mb-3">Prioritized Action Items</h5>
-              <div className="row g-3">
-                {data.recommendations?.recommendations?.map((r, i) => (
-                  <div className="col-12" key={i}>
-                    <div className="p-3 border rounded">
-                      <div className="d-flex justify-content-between mb-2">
-                        <h6 className="fw-bold mb-0 text-dark">{r.title}</h6>
-                        <span className={`badge ${r.priority === 'CRITICAL' ? 'bg-danger' : r.priority === 'HIGH' ? 'bg-warning text-dark' : 'bg-secondary'}`}>
-                          {r.priority}
-                        </span>
-                      </div>
-                      <p className="small mb-1 text-dark"><strong>Action:</strong> {r.action}</p>
-                      <p className="small mb-0 text-muted"><strong>Rationale:</strong> {r.rationale}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
+            <div className="prob-track">
+              <div className={`prob-fill ${bandOf(label)}`} style={{ width: `${prob * 100}%` }} />
             </div>
-          )}
-        </>
+          </div>
+        ))}
+        <div className="model-note">
+          <strong>Model:</strong> RandomForestClassifier — SMOTE-balanced, 200 estimators
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderHotspots = () => (
+    <div className="panel">
+      <h5>Defect hotspots</h5>
+      <p className="panel-desc">High churn X high complexity</p>
+      {hotspots.length === 0 ? (
+        <p className="muted-note">No hotspots detected in this repository.</p>
+      ) : (
+        <div className="table-scroll">
+          <table className="hotspot-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>File path</th>
+                <th>Churn</th>
+                <th>Avg CC</th>
+                <th>Max CC</th>
+                <th>Hotspot score</th>
+              </tr>
+            </thead>
+            <tbody>
+              {hotspots.map((h, i) => (
+                <tr key={i}>
+                  <td className="rank">{i + 1}</td>
+                  <td className="filepath">{h.filepath}</td>
+                  <td>{h.churn}</td>
+                  <td>{h.avg_cc}</td>
+                  <td><span className={`chip ${h.max_cc > 20 ? 'cc-high' : 'cc-mid'}`}>{h.max_cc}</span></td>
+                  <td className="score">{h.hotspot_score}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
+    </div>
+  );
+
+  const renderSecurity = () => (
+    <div className="panel">
+      <h5>Detected security anti-patterns</h5>
+      <p className="panel-desc">{securityIssues.length} finding{securityIssues.length === 1 ? '' : 's'}</p>
+      {securityIssues.length === 0 ? (
+        <p className="muted-note">No security anti-patterns or secret leaks were detected.</p>
+      ) : (
+        <div className="security-list">
+          {securityIssues.map((sec, i) => {
+            const sev = severityOf(sec);
+            return (
+              <div key={i} className={`security-item sev-${sev}`}>
+                <div className="sec-head">
+                  <div className="sec-title">
+                    {sec.title} <span className="rule">({sec.rule_id})</span>
+                  </div>
+                  <span className={`sev-badge sev-${sev}`}>{sev}</span>
+                </div>
+                <div className="sec-loc">{sec.filepath}:{sec.lineno}</div>
+                <p>{sec.description}</p>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderRecs = () => (
+    <div className="panel">
+      <h5>Prioritized action items</h5>
+      <p className="panel-desc">Ordered by impact and urgency</p>
+      <div className="rec-grid">
+        {recList.map((r, i) => (
+          <div key={i} className={`rec-card prio-${r.priority?.toLowerCase()}`}>
+            <div className="rec-head">
+              <h6>{r.title}</h6>
+              <span className={`prio-tag prio-${r.priority?.toLowerCase()}`}>{r.priority}</span>
+            </div>
+            <p><strong>Action:</strong> {r.action}</p>
+            <p><strong>Rationale:</strong> {r.rationale}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  const renderHistory = () => (
+    <div className="panel">
+      <div className="panel-title-row">
+        <div>
+          <h5>Previous scans</h5>
+          <p className="panel-desc">Stored in your account's database</p>
+        </div>
+        <button className="btn-ghost" onClick={fetchHistory} disabled={historyLoading}>
+          {historyLoading ? 'Refreshing…' : 'Refresh'}
+        </button>
+      </div>
+      {historyError && <div className="error-banner" style={{ marginTop: 0 }}>{historyError}</div>}
+      {!historyError && !historyLoading && history.length === 0 && (
+        <p className="muted-note">No scans saved yet. Run your first analysis from the Repository Scanner.</p>
+      )}
+      <div className="history-list">
+        {history.map((row, i) => {
+          const score = row.overall_rhi ?? row.rhi ?? row.score;
+          const label = row.label ?? row.rhi_label;
+          const when = row.created_at || row.timestamp || row.scanned_at;
+          return (
+            <div key={row.id ?? i} className="history-row">
+              <div className="history-main">
+                <span className="mono history-name">{row.repo_name || row.repo_path || 'Unnamed repository'}</span>
+                <span className="history-sub">{when ? new Date(when).toLocaleString() : '—'}</span>
+              </div>
+              {score != null && <span className="mono history-score">{score}</span>}
+              {label && <span className={`pill ${bandOf(label)}`}>{label}</span>}
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button className="btn-ghost" onClick={() => openFromHistory(row)}>View Report</button>
+                <button className="btn-ghost" onClick={() => {
+                  setRepoPath(row.repo_path || row.repo_name || '');
+                  setView('scanner');
+                }}>Re-scan</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  const renderExport = () => (
+    <div className="grid-2">
+      <div className="panel export-card">
+        <h5>PDF report</h5>
+        <p className="panel-desc">Opens a print-ready audit for <span className="mono">{data.repo_name}</span>. Choose “Save as PDF” in the print dialog.</p>
+        <button className="btn-run" onClick={downloadPdfReport}>Export PDF</button>
+      </div>
+      <div className="panel export-card">
+        <h5>Markdown report</h5>
+        <p className="panel-desc">A portable .md summary you can commit alongside the repository or paste into an issue.</p>
+        <button className="btn-run" onClick={downloadMarkdownReport}>Download .md</button>
+      </div>
+    </div>
+  );
+
+  const renderView = () => {
+    if (view === 'scanner') return renderScanner();
+    if (view === 'history') return renderHistory();
+    if (!data) return <EmptyData />;
+    switch (view) {
+      case 'overview': return renderOverview();
+      case 'ml': return renderML();
+      case 'hotspots': return renderHotspots();
+      case 'security': return renderSecurity();
+      case 'recs': return renderRecs();
+      case 'export': return renderExport();
+      default: return null;
+    }
+  };
+
+  // -----------------------------------------------------------------
+  // Dashboard shell: sidebar + status bar + scrollable view
+  // -----------------------------------------------------------------
+  return (
+    <div className={`dash ${collapsed ? 'is-collapsed' : ''} ${drawerOpen ? 'drawer-open' : ''}`}>
+      {drawerOpen && <div className="scrim" onClick={() => setDrawerOpen(false)} />}
+
+      <aside className="sidebar" aria-label="Primary navigation">
+        <div className="sb-header">
+          <div className="sb-brand">
+            <span className="sb-logo">◆</span>
+            <div className="sb-brand-text">
+              <span className="sb-title">GitMetric AI</span>
+              <span className="sb-version">v1.0</span>
+            </div>
+          </div>
+          <button
+            className="sb-collapse"
+            onClick={() => setCollapsed(!collapsed)}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {collapsed ? '»' : '«'}
+          </button>
+        </div>
+
+        <div className={`status-pill ${status.cls}`} title={status.text}>
+          <span className="status-dot" />
+          <span className="status-text">{status.text}</span>
+        </div>
+
+        <nav className="sb-nav">
+          {NAV_SECTIONS.map((section) => (
+            <div className="sb-section" key={section.title}>
+              <div className="sb-section-title">{section.title}</div>
+              {section.items.map((item) => {
+                const badge = item.badge ? badgeValues[item.badge] : null;
+                const locked = item.needsData && !data;
+                return (
+                  <button
+                    key={item.id}
+                    className={`sb-item ${view === item.id ? 'active' : ''} ${locked ? 'locked' : ''}`}
+                    onClick={() => goTo(item.id)}
+                    aria-current={view === item.id ? 'page' : undefined}
+                    title={item.label}
+                  >
+                    <span className="sb-icon">{item.icon}</span>
+                    <span className="sb-label">{item.label}</span>
+                    {badge != null && (
+                      <span className={`sb-badge ${item.badge === 'security' && badge > 0 ? 'danger' : ''}`}>{badge}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </nav>
+
+        <div className="sb-footer">
+          <div className="sb-user">
+            <span className="sb-avatar">{user.charAt(0).toUpperCase() || '?'}</span>
+            <span className="sb-username">{user}</span>
+          </div>
+          <button className="sb-signout" onClick={handleLogout} title="Sign out">
+            <span className="sb-icon">⏻</span>
+            <span className="sb-label">Sign Out</span>
+          </button>
+        </div>
+      </aside>
+
+      <div className="main-col">
+        <header className="statusbar">
+          <button className="hamburger" onClick={() => setDrawerOpen(true)} aria-label="Open navigation">☰</button>
+          <div className="statusbar-title">
+            <h1>{viewTitle}</h1>
+            <p>{viewSubtitle}</p>
+          </div>
+          <div className="statusbar-right">
+            {data && <span className="repo-chip mono" title="Loaded repository">{data.repo_name}</span>}
+            <span className={`status-pill compact ${status.cls}`}>
+              <span className="status-dot" />
+              {status.text}
+            </span>
+          </div>
+        </header>
+
+        <main className="view" ref={viewRef}>
+          <div className="view-inner">{renderView()}</div>
+        </main>
+      </div>
     </div>
   );
 }
